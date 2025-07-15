@@ -1,7 +1,9 @@
-// validate.js
-
 import net from "net";
 import dns from "dns/promises";
+import fs from "fs/promises";
+import path from "path";
+import { v4 as uuidv4 } from "uuid";
+import Papa from "papaparse";
 
 const log = (level, message, metadata = {}) => {
   const timestamp = new Date().toISOString();
@@ -15,6 +17,15 @@ const log = (level, message, metadata = {}) => {
 };
 
 const SMTP_TIMEOUT = 30000;
+const UPLOAD_DIR = "./uploads";
+const RESULTS_DIR = "./results";
+
+// Ensure directories exist
+await fs.mkdir(UPLOAD_DIR, { recursive: true });
+await fs.mkdir(RESULTS_DIR, { recursive: true });
+
+// In-memory store for file processing status
+const fileJobs = new Map();
 
 export async function validateEmail(req, res) {
   res.set("Access-Control-Allow-Origin", "*");
@@ -60,7 +71,6 @@ export async function validateEmail(req, res) {
 
     log("info", "Email format validated", { email, domain });
 
-    // Get actual MX records instead of guessing
     const mxServers = await getMXServers(domain);
 
     if (mxServers.length === 0) {
@@ -126,7 +136,8 @@ export async function validateEmail(req, res) {
   }
 }
 
-export async function validateEmailBatch(req, res) {
+// NEW: Upload CSV file for batch validation
+export async function validateBatch(req, res) {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.set("Access-Control-Allow-Headers", "Content-Type");
@@ -137,137 +148,378 @@ export async function validateEmailBatch(req, res) {
   }
 
   try {
-    const { emails, timeout = 30000, maxConcurrent = 5 } = req.body;
+    // Handle file upload (assuming multer or similar middleware)
+    const file = req.file || req.body.file;
+    const emailColumn = req.body.email_address_column || "1";
+    const hasHeader = req.body.has_header_row === "true";
+    const removeDuplicates = req.body.remove_duplicate === "true";
 
-    if (!Array.isArray(emails) || emails.length === 0) {
-      log("warn", "Batch validation failed: invalid emails array", {
-        emailsType: typeof emails,
-        emailsLength: Array.isArray(emails) ? emails.length : "not array",
-        ip: req.ip || req.connection.remoteAddress,
+    if (!file) {
+      return res.status(400).json({
+        success: false,
+        error: "No file uploaded",
       });
-      return res
-        .status(400)
-        .json({ success: false, error: "emails array is required" });
     }
 
-    log("info", "Starting batch email validation", {
-      emailCount: emails.length,
-      timeout,
-      maxConcurrent,
-      ip: req.ip || req.connection.remoteAddress,
+    const fileId = uuidv4();
+    const uploadPath = path.join(UPLOAD_DIR, `${fileId}.csv`);
+
+    // Save uploaded file
+    let csvContent;
+    if (typeof file === "string") {
+      csvContent = file;
+    } else if (file.buffer) {
+      csvContent = file.buffer.toString();
+    } else {
+      csvContent = await fs.readFile(file.path, "utf8");
+    }
+
+    await fs.writeFile(uploadPath, csvContent);
+
+    // Parse CSV to extract emails
+    const emails = await extractEmailsFromCSV(
+      uploadPath,
+      emailColumn,
+      hasHeader,
+      removeDuplicates
+    );
+
+    // Initialize job status
+    fileJobs.set(fileId, {
+      fileId,
+      status: "processing",
+      totalEmails: emails.length,
+      processedEmails: 0,
+      validEmails: 0,
+      invalidEmails: 0,
+      uploadedAt: new Date().toISOString(),
+      startedAt: new Date().toISOString(),
+      completedAt: null,
+      error: null,
     });
 
-    const results = [];
+    log("info", "Batch validation job created", {
+      fileId,
+      totalEmails: emails.length,
+      emailColumn,
+      hasHeader,
+      removeDuplicates,
+    });
+
+    // Start processing asynchronously
+    processBatchValidation(fileId, emails);
+
+    res.json({
+      success: true,
+      file_id: fileId,
+      message: "File uploaded and processing started",
+    });
+  } catch (error) {
+    log("error", "Batch validation upload error", {
+      error: error.message,
+      stack: error.stack,
+    });
+    res.status(500).json({ success: false, error: error.message });
+  }
+}
+
+// NEW: Check file processing status
+export async function fileStatus(req, res) {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    res.status(204).send("");
+    return;
+  }
+
+  try {
+    const fileId = req.query.file_id;
+
+    if (!fileId) {
+      return res.status(400).json({
+        success: false,
+        error: "file_id parameter is required",
+      });
+    }
+
+    const job = fileJobs.get(fileId);
+
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        error: "File not found",
+      });
+    }
+
+    const response = {
+      success: true,
+      file_id: fileId,
+      file_status: job.status,
+      total_emails: job.totalEmails,
+      processed_emails: job.processedEmails,
+      valid_emails: job.validEmails,
+      invalid_emails: job.invalidEmails,
+      progress_percentage:
+        job.totalEmails > 0
+          ? Math.round((job.processedEmails / job.totalEmails) * 100)
+          : 0,
+      uploaded_at: job.uploadedAt,
+      started_at: job.startedAt,
+      completed_at: job.completedAt,
+      error: job.error,
+    };
+
+    log("info", "File status checked", {
+      fileId,
+      status: job.status,
+      progress: response.progress_percentage,
+    });
+
+    res.json(response);
+  } catch (error) {
+    log("error", "File status check error", {
+      error: error.message,
+      fileId: req.query.file_id,
+    });
+    res.status(500).json({ success: false, error: error.message });
+  }
+}
+
+// NEW: Download processed results
+export async function downloadFile(req, res) {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    res.status(204).send("");
+    return;
+  }
+
+  try {
+    const fileId = req.query.file_id;
+
+    if (!fileId) {
+      return res.status(400).json({
+        success: false,
+        error: "file_id parameter is required",
+      });
+    }
+
+    const job = fileJobs.get(fileId);
+
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        error: "File not found",
+      });
+    }
+
+    if (job.status !== "complete") {
+      return res.status(400).json({
+        success: false,
+        error: `File is not ready for download. Current status: ${job.status}`,
+      });
+    }
+
+    const resultPath = path.join(RESULTS_DIR, `${fileId}_results.csv`);
+
+    try {
+      await fs.access(resultPath);
+    } catch {
+      return res.status(404).json({
+        success: false,
+        error: "Result file not found",
+      });
+    }
+
+    log("info", "File download requested", { fileId });
+
+    // Set headers for CSV download
+    res.set("Content-Type", "text/csv");
+    res.set(
+      "Content-Disposition",
+      `attachment; filename="validation_results_${fileId}.csv"`
+    );
+
+    const fileStream = await fs.readFile(resultPath);
+    res.send(fileStream);
+  } catch (error) {
+    log("error", "File download error", {
+      error: error.message,
+      fileId: req.query.file_id,
+    });
+    res.status(500).json({ success: false, error: error.message });
+  }
+}
+
+// Helper function to extract emails from CSV
+async function extractEmailsFromCSV(
+  filePath,
+  emailColumn,
+  hasHeader,
+  removeDuplicates
+) {
+  const csvContent = await fs.readFile(filePath, "utf8");
+
+  return new Promise((resolve, reject) => {
+    Papa.parse(csvContent, {
+      header: false,
+      skipEmptyLines: true,
+      complete: (results) => {
+        try {
+          let data = results.data;
+
+          // Remove header if specified
+          if (hasHeader && data.length > 0) {
+            data = data.slice(1);
+          }
+
+          // Extract emails from specified column (1-indexed)
+          const columnIndex = parseInt(emailColumn) - 1;
+          let emails = data
+            .map((row) => row[columnIndex])
+            .filter((email) => email && email.includes("@"));
+
+          // Remove duplicates if specified
+          if (removeDuplicates) {
+            emails = [...new Set(emails.map((email) => email.toLowerCase()))];
+          }
+
+          resolve(emails);
+        } catch (error) {
+          reject(error);
+        }
+      },
+      error: (error) => {
+        reject(error);
+      },
+    });
+  });
+}
+
+// Background processing function
+async function processBatchValidation(fileId, emails) {
+  const job = fileJobs.get(fileId);
+  const maxConcurrent = 3;
+  const results = [];
+
+  try {
+    log("info", "Starting batch processing", {
+      fileId,
+      totalEmails: emails.length,
+    });
 
     for (let i = 0; i < emails.length; i += maxConcurrent) {
       const batch = emails.slice(i, i + maxConcurrent);
-      const batchNumber = Math.floor(i / maxConcurrent) + 1;
-      const totalBatches = Math.ceil(emails.length / maxConcurrent);
-
-      log("info", "Processing batch", {
-        batchNumber,
-        totalBatches,
-        batchSize: batch.length,
-        startIndex: i,
-      });
 
       const batchResults = await Promise.all(
         batch.map(async (email) => {
           try {
             const domain = email.split("@")[1];
             const mxServers = await getMXServers(domain);
-            let success = false;
+            let valid = false;
             let error = "";
 
-            log("debug", "Processing email in batch", {
-              email,
-              domain,
-              mxServers,
-            });
-
             if (mxServers.length === 0) {
-              return { email, valid: false, error: "No MX records found" };
-            }
-
-            for (const mxServer of mxServers) {
-              try {
-                success = await testSmtpConnection(mxServer, email);
-                if (success) {
-                  log("debug", "Email validated in batch", { email, mxServer });
-                  break;
+              error = "No MX records found";
+            } else {
+              for (const mxServer of mxServers) {
+                try {
+                  valid = await testSmtpConnection(mxServer, email);
+                  if (valid) break;
+                } catch (err) {
+                  error = err.message;
                 }
-              } catch (err) {
-                error = err.message;
-                log("debug", "Email validation failed in batch", {
-                  email,
-                  mxServer,
-                  error: err.message,
-                });
               }
             }
 
-            return { email, valid: success, error: success ? null : error };
-          } catch (err) {
-            log("warn", "Email processing error in batch", {
+            // Update job progress
+            job.processedEmails++;
+            if (valid) {
+              job.validEmails++;
+            } else {
+              job.invalidEmails++;
+            }
+
+            return {
               email,
+              status: valid ? "valid" : "invalid",
+              error: valid ? "" : error,
+              domain,
+              mxServers: mxServers.join(", "),
+              processed_at: new Date().toISOString(),
+            };
+          } catch (err) {
+            job.processedEmails++;
+            job.invalidEmails++;
+            return {
+              email,
+              status: "invalid",
               error: err.message,
-            });
-            return { email, valid: false, error: err.message };
+              domain: "",
+              mxServers: "",
+              processed_at: new Date().toISOString(),
+            };
           }
         })
       );
 
       results.push(...batchResults);
 
-      log("info", "Batch completed", {
-        batchNumber,
-        processedCount: batchResults.length,
-        validCount: batchResults.filter((r) => r.valid).length,
-      });
-
+      // Small delay between batches
       if (i + maxConcurrent < emails.length) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
     }
 
-    const validCount = results.filter((r) => r.valid).length;
-    const invalidCount = emails.length - validCount;
-
-    const response = {
-      success: true,
-      totalProcessed: emails.length,
-      validEmails: validCount,
-      invalidEmails: invalidCount,
-      results,
-    };
-
-    log("info", "Batch validation completed", {
-      totalProcessed: emails.length,
-      validEmails: validCount,
-      invalidEmails: invalidCount,
-      successRate: ((validCount / emails.length) * 100).toFixed(2) + "%",
-      processingTime: Date.now() - req.startTime,
+    // Save results to CSV
+    const resultPath = path.join(RESULTS_DIR, `${fileId}_results.csv`);
+    const csvData = Papa.unparse(results, {
+      header: true,
+      columns: [
+        "email",
+        "status",
+        "error",
+        "domain",
+        "mxServers",
+        "processed_at",
+      ],
     });
 
-    res.json(response);
+    await fs.writeFile(resultPath, csvData);
+
+    // Update job status
+    job.status = "complete";
+    job.completedAt = new Date().toISOString();
+
+    log("info", "Batch processing completed", {
+      fileId,
+      totalEmails: emails.length,
+      validEmails: job.validEmails,
+      invalidEmails: job.invalidEmails,
+      processingTime: new Date() - new Date(job.startedAt),
+    });
   } catch (error) {
-    log("error", "Batch validation error", {
+    job.status = "error";
+    job.error = error.message;
+    job.completedAt = new Date().toISOString();
+
+    log("error", "Batch processing failed", {
+      fileId,
       error: error.message,
-      stack: error.stack,
-      ip: req.ip || req.connection.remoteAddress,
     });
-    res.status(500).json({ success: false, error: error.message });
   }
 }
 
-// NEW FUNCTION: Get actual MX records for a domain
+// Existing helper functions remain the same...
 async function getMXServers(domain) {
   try {
     log("debug", "Looking up MX records", { domain });
 
     const mxRecords = await dns.resolveMx(domain);
-
-    // Sort by priority (lower number = higher priority)
     const sortedServers = mxRecords
       .sort((a, b) => a.priority - b.priority)
       .map((record) => record.exchange);
@@ -282,7 +534,6 @@ async function getMXServers(domain) {
   } catch (error) {
     log("warn", "MX lookup failed", { domain, error: error.message });
 
-    // Fallback to common server names if MX lookup fails
     const fallbackServers = [
       `smtp.${domain}`,
       `mail.${domain}`,
@@ -430,7 +681,6 @@ async function testSmtpConnection(mxServer, targetEmail) {
   return false;
 }
 
-// Network connectivity test endpoint
 export async function testNetworkConnectivity(req, res) {
   const testResults = {
     timestamp: new Date().toISOString(),
@@ -443,7 +693,6 @@ export async function testNetworkConnectivity(req, res) {
     tests: [],
   };
 
-  // Test common SMTP servers
   const testServers = [
     { server: "smtp.gmail.com", ports: [25, 587, 465] },
     { server: "smtp.outlook.com", ports: [25, 587] },
@@ -483,7 +732,6 @@ export async function testNetworkConnectivity(req, res) {
     }
   }
 
-  // Test DNS resolution
   try {
     const mxRecords = await getMXServers("gmail.com");
     testResults.dnsTest = {
@@ -501,7 +749,6 @@ export async function testNetworkConnectivity(req, res) {
   res.json(testResults);
 }
 
-// Helper function to test port connectivity
 async function testPortConnectivity(host, port, timeout = 5000) {
   return new Promise((resolve) => {
     const socket = net.createConnection(port, host);
