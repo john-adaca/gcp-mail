@@ -1,6 +1,7 @@
 // validate.js
 
 import net from "net";
+import dns from "dns/promises";
 
 const log = (level, message, metadata = {}) => {
   const timestamp = new Date().toISOString();
@@ -8,7 +9,7 @@ const log = (level, message, metadata = {}) => {
     timestamp,
     level,
     message,
-    ...metadata
+    ...metadata,
   };
   console.log(JSON.stringify(logEntry));
 };
@@ -30,62 +31,70 @@ export async function validateEmail(req, res) {
       req.method === "POST" ? req.body : req.query;
 
     if (!email) {
-      log('warn', 'Email validation failed: missing email parameter', {
+      log("warn", "Email validation failed: missing email parameter", {
         method: req.method,
-        ip: req.ip || req.connection.remoteAddress
+        ip: req.ip || req.connection.remoteAddress,
       });
       return res
         .status(400)
         .json({ success: false, error: "Email parameter is required" });
     }
 
-    log('info', 'Starting email validation', {
+    log("info", "Starting email validation", {
       email,
       timeout,
       method: req.method,
-      ip: req.ip || req.connection.remoteAddress
+      ip: req.ip || req.connection.remoteAddress,
     });
+
     const domain = email.split("@")[1];
     if (!domain) {
-      log('warn', 'Email validation failed: invalid format', {
+      log("warn", "Email validation failed: invalid format", {
         email,
-        ip: req.ip || req.connection.remoteAddress
+        ip: req.ip || req.connection.remoteAddress,
       });
       return res
         .status(400)
         .json({ success: false, error: "Invalid email format" });
     }
 
-    log('info', 'Email format validated', { email, domain });
+    log("info", "Email format validated", { email, domain });
 
-    const mxServers = [
-      `smtp.${domain}`,
-      `mail.${domain}`,
-      `mx.${domain}`,
-      `mx1.${domain}`,
-    ];
+    // Get actual MX records instead of guessing
+    const mxServers = await getMXServers(domain);
+
+    if (mxServers.length === 0) {
+      log("warn", "No MX records found", { email, domain });
+      return res.json({
+        success: false,
+        email,
+        domain,
+        error: "No MX records found for domain",
+      });
+    }
+
     let result = false;
     let lastError = "";
 
     for (const mxServer of mxServers) {
       try {
-        log('info', 'Testing MX server', { mxServer, email });
+        log("info", "Testing MX server", { mxServer, email });
         result = await testSmtpConnection(mxServer, email);
         if (result) {
-          log('info', 'Email validated successfully', {
+          log("info", "Email validated successfully", {
             email,
             domain,
             mxServer,
-            validationResult: true
+            validationResult: true,
           });
           break;
         }
       } catch (error) {
         lastError = error.message;
-        log('warn', 'MX server test failed', {
+        log("warn", "MX server test failed", {
           mxServer,
           email,
-          error: error.message
+          error: error.message,
         });
       }
     }
@@ -94,23 +103,24 @@ export async function validateEmail(req, res) {
       success: result,
       email,
       domain,
+      mxServers,
       error: result ? null : lastError || "No SMTP servers responded",
     };
 
-    log('info', 'Email validation completed', {
+    log("info", "Email validation completed", {
       email,
       domain,
       success: result,
       error: response.error,
-      processingTime: Date.now() - req.startTime
+      processingTime: Date.now() - req.startTime,
     });
 
     res.json(response);
   } catch (error) {
-    log('error', 'Email validation error', {
+    log("error", "Email validation error", {
       error: error.message,
       stack: error.stack,
-      ip: req.ip || req.connection.remoteAddress
+      ip: req.ip || req.connection.remoteAddress,
     });
     res.status(500).json({ success: false, error: error.message });
   }
@@ -130,22 +140,23 @@ export async function validateEmailBatch(req, res) {
     const { emails, timeout = 30000, maxConcurrent = 5 } = req.body;
 
     if (!Array.isArray(emails) || emails.length === 0) {
-      log('warn', 'Batch validation failed: invalid emails array', {
+      log("warn", "Batch validation failed: invalid emails array", {
         emailsType: typeof emails,
-        emailsLength: Array.isArray(emails) ? emails.length : 'not array',
-        ip: req.ip || req.connection.remoteAddress
+        emailsLength: Array.isArray(emails) ? emails.length : "not array",
+        ip: req.ip || req.connection.remoteAddress,
       });
       return res
         .status(400)
         .json({ success: false, error: "emails array is required" });
     }
 
-    log('info', 'Starting batch email validation', {
+    log("info", "Starting batch email validation", {
       emailCount: emails.length,
       timeout,
       maxConcurrent,
-      ip: req.ip || req.connection.remoteAddress
+      ip: req.ip || req.connection.remoteAddress,
     });
+
     const results = [];
 
     for (let i = 0; i < emails.length; i += maxConcurrent) {
@@ -153,45 +164,53 @@ export async function validateEmailBatch(req, res) {
       const batchNumber = Math.floor(i / maxConcurrent) + 1;
       const totalBatches = Math.ceil(emails.length / maxConcurrent);
 
-      log('info', 'Processing batch', {
+      log("info", "Processing batch", {
         batchNumber,
         totalBatches,
         batchSize: batch.length,
-        startIndex: i
+        startIndex: i,
       });
 
       const batchResults = await Promise.all(
         batch.map(async (email) => {
           try {
             const domain = email.split("@")[1];
-            const mxServers = [`smtp.${domain}`, `mail.${domain}`];
+            const mxServers = await getMXServers(domain);
             let success = false;
             let error = "";
 
-            log('debug', 'Processing email in batch', { email, domain });
+            log("debug", "Processing email in batch", {
+              email,
+              domain,
+              mxServers,
+            });
+
+            if (mxServers.length === 0) {
+              return { email, valid: false, error: "No MX records found" };
+            }
 
             for (const mxServer of mxServers) {
               try {
                 success = await testSmtpConnection(mxServer, email);
                 if (success) {
-                  log('debug', 'Email validated in batch', { email, mxServer });
+                  log("debug", "Email validated in batch", { email, mxServer });
                   break;
                 }
               } catch (err) {
                 error = err.message;
-                log('debug', 'Email validation failed in batch', {
+                log("debug", "Email validation failed in batch", {
                   email,
                   mxServer,
-                  error: err.message
+                  error: err.message,
                 });
               }
             }
 
             return { email, valid: success, error: success ? null : error };
           } catch (err) {
-            log('warn', 'Email processing error in batch', {
+            log("warn", "Email processing error in batch", {
               email,
-              error: err.message
+              error: err.message,
             });
             return { email, valid: false, error: err.message };
           }
@@ -199,11 +218,11 @@ export async function validateEmailBatch(req, res) {
       );
 
       results.push(...batchResults);
-      
-      log('info', 'Batch completed', {
+
+      log("info", "Batch completed", {
         batchNumber,
         processedCount: batchResults.length,
-        validCount: batchResults.filter(r => r.valid).length
+        validCount: batchResults.filter((r) => r.valid).length,
       });
 
       if (i + maxConcurrent < emails.length) {
@@ -222,22 +241,57 @@ export async function validateEmailBatch(req, res) {
       results,
     };
 
-    log('info', 'Batch validation completed', {
+    log("info", "Batch validation completed", {
       totalProcessed: emails.length,
       validEmails: validCount,
       invalidEmails: invalidCount,
-      successRate: ((validCount / emails.length) * 100).toFixed(2) + '%',
-      processingTime: Date.now() - req.startTime
+      successRate: ((validCount / emails.length) * 100).toFixed(2) + "%",
+      processingTime: Date.now() - req.startTime,
     });
 
     res.json(response);
   } catch (error) {
-    log('error', 'Batch validation error', {
+    log("error", "Batch validation error", {
       error: error.message,
       stack: error.stack,
-      ip: req.ip || req.connection.remoteAddress
+      ip: req.ip || req.connection.remoteAddress,
     });
     res.status(500).json({ success: false, error: error.message });
+  }
+}
+
+// NEW FUNCTION: Get actual MX records for a domain
+async function getMXServers(domain) {
+  try {
+    log("debug", "Looking up MX records", { domain });
+
+    const mxRecords = await dns.resolveMx(domain);
+
+    // Sort by priority (lower number = higher priority)
+    const sortedServers = mxRecords
+      .sort((a, b) => a.priority - b.priority)
+      .map((record) => record.exchange);
+
+    log("debug", "MX records found", {
+      domain,
+      mxRecords: mxRecords.map((r) => `${r.exchange} (${r.priority})`),
+      sortedServers,
+    });
+
+    return sortedServers;
+  } catch (error) {
+    log("warn", "MX lookup failed", { domain, error: error.message });
+
+    // Fallback to common server names if MX lookup fails
+    const fallbackServers = [
+      `smtp.${domain}`,
+      `mail.${domain}`,
+      `mx.${domain}`,
+      `mx1.${domain}`,
+    ];
+
+    log("debug", "Using fallback MX servers", { domain, fallbackServers });
+    return fallbackServers;
   }
 }
 
@@ -246,21 +300,21 @@ async function testSmtpConnection(mxServer, targetEmail) {
   const domain = sender.split("@")[1];
   const ports = [25, 587, 465];
 
-  log('debug', 'Starting SMTP connection test', {
+  log("debug", "Starting SMTP connection test", {
     mxServer,
     targetEmail,
     sender,
-    ports
+    ports,
   });
 
   for (const port of ports) {
     try {
-      log('debug', 'Attempting SMTP connection', {
+      log("debug", "Attempting SMTP connection", {
         mxServer,
         port,
-        targetEmail
+        targetEmail,
       });
-      
+
       const result = await new Promise((resolve, reject) => {
         const socket = net.createConnection(port, mxServer);
         socket.setTimeout(SMTP_TIMEOUT);
@@ -307,19 +361,19 @@ async function testSmtpConnection(mxServer, targetEmail) {
             resolved = true;
             socket.destroy();
             if (error) {
-              log('debug', 'SMTP connection failed', {
+              log("debug", "SMTP connection failed", {
                 mxServer,
                 port,
                 targetEmail,
-                error
+                error,
               });
               reject(new Error(error));
             } else {
-              log('debug', 'SMTP connection result', {
+              log("debug", "SMTP connection result", {
                 mxServer,
                 port,
                 targetEmail,
-                success: result
+                success: result,
               });
               resolve(result);
             }
@@ -345,29 +399,29 @@ async function testSmtpConnection(mxServer, targetEmail) {
       });
 
       if (result) {
-        log('debug', 'SMTP validation successful', {
+        log("debug", "SMTP validation successful", {
           mxServer,
           port,
-          targetEmail
+          targetEmail,
         });
         return result;
       }
     } catch (error) {
-      log('debug', 'SMTP connection attempt failed', {
+      log("debug", "SMTP connection attempt failed", {
         mxServer,
         port,
         targetEmail,
-        error: error.message
+        error: error.message,
       });
       continue;
     }
   }
 
-  log('debug', 'All SMTP connection attempts failed', {
+  log("debug", "All SMTP connection attempts failed", {
     mxServer,
     targetEmail,
-    testedPorts: ports
+    testedPorts: ports,
   });
-  
+
   return false;
 }
