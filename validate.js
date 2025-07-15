@@ -257,6 +257,7 @@ export async function fileStatus(req, res) {
       success: true,
       file_id: fileId,
       file_status: job.status,
+      downloadable: job.status === "complete",
       total_emails: job.totalEmails,
       processed_emails: job.processedEmails,
       valid_emails: job.validEmails,
