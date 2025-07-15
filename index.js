@@ -33,6 +33,10 @@ app.use(bodyParser.json());
 // Routes
 app.post("/validateEmail", validateEmail);
 app.post("/validateEmailBatch", validateEmailBatch);
+app.get("/test-network", async (req, res) => {
+  const { testNetworkConnectivity } = await import("./validate.js");
+  await testNetworkConnectivity(req, res);
+});
 
 // Health check
 app.get("/", (req, res) => {

@@ -392,8 +392,8 @@ async function testSmtpConnection(mxServer, targetEmail) {
           }
         });
 
-        socket.on("timeout", () => finish(false, "Timeout"));
-        socket.on("error", (err) => finish(false, err.message));
+        socket.on("timeout", () => finish(false, `Timeout after ${SMTP_TIMEOUT}ms`));
+        socket.on("error", (err) => finish(false, `Socket error: ${err.message} (${err.code})`));
         socket.on("end", () => finish(success));
         socket.on("close", () => finish(success));
       });
@@ -424,4 +424,98 @@ async function testSmtpConnection(mxServer, targetEmail) {
   });
 
   return false;
+}
+
+// Network connectivity test endpoint
+export async function testNetworkConnectivity(req, res) {
+  const testResults = {
+    timestamp: new Date().toISOString(),
+    environment: {
+      nodeVersion: process.version,
+      platform: process.platform,
+      cloudRun: !!process.env.PORT,
+      vpc: !!process.env.VPC_CONNECTOR_NAME
+    },
+    tests: []
+  };
+
+  // Test common SMTP servers
+  const testServers = [
+    { server: "smtp.gmail.com", ports: [25, 587, 465] },
+    { server: "smtp.outlook.com", ports: [25, 587] },
+    { server: "aspmx.l.google.com", ports: [25] }
+  ];
+
+  for (const { server, ports } of testServers) {
+    for (const port of ports) {
+      try {
+        const result = await testPortConnectivity(server, port, 5000);
+        testResults.tests.push({
+          server,
+          port,
+          success: result,
+          error: result ? null : "Connection failed"
+        });
+        
+        log('info', 'Network connectivity test', {
+          server,
+          port,
+          success: result
+        });
+      } catch (error) {
+        testResults.tests.push({
+          server,
+          port,
+          success: false,
+          error: error.message
+        });
+        
+        log('warn', 'Network connectivity test failed', {
+          server,
+          port,
+          error: error.message
+        });
+      }
+    }
+  }
+
+  // Test DNS resolution
+  try {
+    const mxRecords = await getMXServers("gmail.com");
+    testResults.dnsTest = {
+      success: mxRecords.length > 0,
+      mxRecords
+    };
+  } catch (error) {
+    testResults.dnsTest = {
+      success: false,
+      error: error.message
+    };
+  }
+
+  log('info', 'Network connectivity test completed', testResults);
+  res.json(testResults);
+}
+
+// Helper function to test port connectivity
+async function testPortConnectivity(host, port, timeout = 5000) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection(port, host);
+    socket.setTimeout(timeout);
+    
+    socket.on('connect', () => {
+      socket.destroy();
+      resolve(true);
+    });
+    
+    socket.on('timeout', () => {
+      socket.destroy();
+      resolve(false);
+    });
+    
+    socket.on('error', () => {
+      socket.destroy();
+      resolve(false);
+    });
+  });
 }
