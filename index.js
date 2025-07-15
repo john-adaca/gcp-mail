@@ -2,7 +2,7 @@
 
 import express from "express";
 import bodyParser from "body-parser";
-import { validateEmail, validateBatch } from "./validate.js";
+import { validateEmail, validateBatch, fileStatus, downloadFile } from "./validate.js";
 
 const log = (level, message, metadata = {}) => {
   const timestamp = new Date().toISOString();
@@ -33,6 +33,8 @@ app.use(bodyParser.json());
 // Routes
 app.post("/validateEmail", validateEmail);
 app.post("/validateEmailBatch", validateBatch);
+app.get("/fileStatus", fileStatus);
+app.get("/downloadFile", downloadFile);
 app.get("/test-network", async (req, res) => {
   const { testNetworkConnectivity } = await import("./validate.js");
   await testNetworkConnectivity(req, res);

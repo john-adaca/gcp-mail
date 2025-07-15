@@ -1,0 +1,11 @@
+email,name,company
+john.doe@gmail.com,John Doe,Google
+jane.smith@outlook.com,Jane Smith,Microsoft
+invalid-email,Bob Johnson,Invalid Corp
+test@yahoo.com,Alice Brown,Yahoo
+admin@example.com,Admin User,Example Inc
+support@github.com,Support Team,GitHub
+user@nonexistentdomain12345.com,Test User,Fake Company
+contact@stackoverflow.com,Stack Overflow,Stack Exchange
+info@reddit.com,Reddit Team,Reddit Inc
+hello@world.test,Hello World,Test Company
