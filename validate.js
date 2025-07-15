@@ -320,7 +320,7 @@ async function testSmtpConnection(mxServer, targetEmail) {
         socket.setTimeout(SMTP_TIMEOUT);
 
         const commands = [
-          `HELO ${domain}\r\n`,
+          `EHLO ${domain}\r\n`,
           `MAIL FROM:<${sender}>\r\n`,
           `RCPT TO:<${targetEmail}>\r\n`,
           `QUIT\r\n`,
@@ -392,8 +392,12 @@ async function testSmtpConnection(mxServer, targetEmail) {
           }
         });
 
-        socket.on("timeout", () => finish(false, `Timeout after ${SMTP_TIMEOUT}ms`));
-        socket.on("error", (err) => finish(false, `Socket error: ${err.message} (${err.code})`));
+        socket.on("timeout", () =>
+          finish(false, `Timeout after ${SMTP_TIMEOUT}ms`)
+        );
+        socket.on("error", (err) =>
+          finish(false, `Socket error: ${err.message} (${err.code})`)
+        );
         socket.on("end", () => finish(success));
         socket.on("close", () => finish(success));
       });
@@ -434,16 +438,16 @@ export async function testNetworkConnectivity(req, res) {
       nodeVersion: process.version,
       platform: process.platform,
       cloudRun: !!process.env.PORT,
-      vpc: !!process.env.VPC_CONNECTOR_NAME
+      vpc: !!process.env.VPC_CONNECTOR_NAME,
     },
-    tests: []
+    tests: [],
   };
 
   // Test common SMTP servers
   const testServers = [
     { server: "smtp.gmail.com", ports: [25, 587, 465] },
     { server: "smtp.outlook.com", ports: [25, 587] },
-    { server: "aspmx.l.google.com", ports: [25] }
+    { server: "aspmx.l.google.com", ports: [25] },
   ];
 
   for (const { server, ports } of testServers) {
@@ -454,26 +458,26 @@ export async function testNetworkConnectivity(req, res) {
           server,
           port,
           success: result,
-          error: result ? null : "Connection failed"
+          error: result ? null : "Connection failed",
         });
-        
-        log('info', 'Network connectivity test', {
+
+        log("info", "Network connectivity test", {
           server,
           port,
-          success: result
+          success: result,
         });
       } catch (error) {
         testResults.tests.push({
           server,
           port,
           success: false,
-          error: error.message
+          error: error.message,
         });
-        
-        log('warn', 'Network connectivity test failed', {
+
+        log("warn", "Network connectivity test failed", {
           server,
           port,
-          error: error.message
+          error: error.message,
         });
       }
     }
@@ -484,16 +488,16 @@ export async function testNetworkConnectivity(req, res) {
     const mxRecords = await getMXServers("gmail.com");
     testResults.dnsTest = {
       success: mxRecords.length > 0,
-      mxRecords
+      mxRecords,
     };
   } catch (error) {
     testResults.dnsTest = {
       success: false,
-      error: error.message
+      error: error.message,
     };
   }
 
-  log('info', 'Network connectivity test completed', testResults);
+  log("info", "Network connectivity test completed", testResults);
   res.json(testResults);
 }
 
@@ -502,18 +506,18 @@ async function testPortConnectivity(host, port, timeout = 5000) {
   return new Promise((resolve) => {
     const socket = net.createConnection(port, host);
     socket.setTimeout(timeout);
-    
-    socket.on('connect', () => {
+
+    socket.on("connect", () => {
       socket.destroy();
       resolve(true);
     });
-    
-    socket.on('timeout', () => {
+
+    socket.on("timeout", () => {
       socket.destroy();
       resolve(false);
     });
-    
-    socket.on('error', () => {
+
+    socket.on("error", () => {
       socket.destroy();
       resolve(false);
     });
