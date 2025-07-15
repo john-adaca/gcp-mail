@@ -550,7 +550,7 @@ async function getMXServers(domain) {
 async function testSmtpConnection(mxServer, targetEmail) {
   const sender = "noreply@adaca.com";
   const domain = sender.split("@")[1];
-  const ports = [25, 587, 465];
+  const ports = [25];
 
   log("debug", "Starting SMTP connection test", {
     mxServer,
