@@ -4,7 +4,17 @@ import fs from "fs/promises";
 import path from "path";
 import { v4 as uuidv4 } from "uuid";
 import Papa from "papaparse";
-import { log } from "./src/common/logger";
+
+const log = (level, message, metadata = {}) => {
+  const timestamp = new Date().toISOString();
+  const logEntry = {
+    timestamp,
+    level,
+    message,
+    ...metadata,
+  };
+  console.log(JSON.stringify(logEntry));
+};
 
 const SMTP_TIMEOUT = 30000;
 const UPLOAD_DIR = "./uploads";
