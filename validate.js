@@ -137,6 +137,7 @@ export async function validateEmail(req, res) {
 }
 
 // NEW: Upload CSV file for batch validation
+// Update your existing validateBatch function
 export async function validateBatch(req, res) {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -148,47 +149,74 @@ export async function validateBatch(req, res) {
   }
 
   try {
-    // Handle file upload (assuming multer or similar middleware)
-    const file = req.file || req.body.file;
-    const emailColumn = req.body.email_address_column || "1";
-    const hasHeader = req.body.has_header_row === "true";
-    const removeDuplicates = req.body.remove_duplicate === "true";
+    const fileId = uuidv4();
+    let emails = [];
+    let employees = [];
+    let domain = null;
+    let isEmployeeValidation = false;
 
-    if (!file) {
-      return res.status(400).json({
-        success: false,
-        error: "No file uploaded",
+    // Check if it's employee validation or CSV upload
+    if (req.body.employees && req.body.domain) {
+      // Employee validation mode
+      employees = req.body.employees;
+      domain = req.body.domain;
+      isEmployeeValidation = true;
+
+      log("info", "Employee validation mode", {
+        fileId,
+        totalEmployees: employees.length,
+        domain,
+      });
+    } else {
+      // CSV upload mode (existing functionality)
+      const file = req.file || req.body.file;
+      const emailColumn = req.body.email_address_column || "1";
+      const hasHeader = req.body.has_header_row === "true";
+      const removeDuplicates = req.body.remove_duplicate === "true";
+
+      if (!file) {
+        return res.status(400).json({
+          success: false,
+          error: "No file uploaded or employees provided",
+        });
+      }
+
+      const uploadPath = path.join(UPLOAD_DIR, `${fileId}.csv`);
+
+      // Save uploaded file
+      let csvContent;
+      if (typeof file === "string") {
+        csvContent = file;
+      } else if (file.buffer) {
+        csvContent = file.buffer.toString();
+      } else {
+        csvContent = await fs.readFile(file.path, "utf8");
+      }
+
+      await fs.writeFile(uploadPath, csvContent);
+
+      // Parse CSV to extract emails
+      emails = await extractEmailsFromCSV(
+        uploadPath,
+        emailColumn,
+        hasHeader,
+        removeDuplicates
+      );
+
+      log("info", "CSV upload mode", {
+        fileId,
+        totalEmails: emails.length,
+        emailColumn,
+        hasHeader,
+        removeDuplicates,
       });
     }
-
-    const fileId = uuidv4();
-    const uploadPath = path.join(UPLOAD_DIR, `${fileId}.csv`);
-
-    // Save uploaded file
-    let csvContent;
-    if (typeof file === "string") {
-      csvContent = file;
-    } else if (file.buffer) {
-      csvContent = file.buffer.toString();
-    } else {
-      csvContent = await fs.readFile(file.path, "utf8");
-    }
-
-    await fs.writeFile(uploadPath, csvContent);
-
-    // Parse CSV to extract emails
-    const emails = await extractEmailsFromCSV(
-      uploadPath,
-      emailColumn,
-      hasHeader,
-      removeDuplicates
-    );
 
     // Initialize job status
     fileJobs.set(fileId, {
       fileId,
       status: "processing",
-      totalEmails: emails.length,
+      totalEmails: isEmployeeValidation ? employees.length : emails.length,
       processedEmails: 0,
       validEmails: 0,
       invalidEmails: 0,
@@ -198,24 +226,22 @@ export async function validateBatch(req, res) {
       error: null,
     });
 
-    log("info", "Batch validation job created", {
-      fileId,
-      totalEmails: emails.length,
-      emailColumn,
-      hasHeader,
-      removeDuplicates,
-    });
-
     // Start processing asynchronously
-    processBatchValidation(fileId, emails);
+    if (isEmployeeValidation) {
+      processBatchValidationWithPatterns(fileId, employees, domain);
+    } else {
+      processBatchValidation(fileId, emails); // Your existing function
+    }
 
     res.json({
       success: true,
       file_id: fileId,
-      message: "File uploaded and processing started",
+      message: isEmployeeValidation
+        ? "Employee validation started"
+        : "File uploaded and processing started",
     });
   } catch (error) {
-    log("error", "Batch validation upload error", {
+    log("error", "Batch validation error", {
       error: error.message,
       stack: error.stack,
     });
@@ -787,4 +813,219 @@ async function testPortConnectivity(host, port, timeout = 5000) {
       resolve(false);
     });
   });
+}
+const domainPatterns = new Map(); // Store detected patterns per domain
+
+// Add this function to detect pattern from a successful email
+function detectPatternFromEmail(email, employee) {
+  const [localPart, domain] = email.split("@");
+  const firstName = employee.firstName.toLowerCase();
+  const lastName = employee.lastName.toLowerCase();
+
+  // Determine which pattern this email follows
+  if (localPart === firstName) {
+    return "firstname";
+  } else if (localPart === `${firstName}.${lastName}`) {
+    return "firstname.lastname";
+  } else if (localPart === `${firstName}${lastName}`) {
+    return "firstnamelastname";
+  } else if (localPart === `${firstName[0]}.${lastName}`) {
+    return "f.lastname";
+  } else if (localPart === `${firstName[0]}${lastName}`) {
+    return "flastname";
+  }
+
+  return "unknown";
+}
+
+// Add this function to generate email based on detected pattern
+function generateEmailFromPattern(employee, domain, pattern) {
+  const firstName = employee.firstName.toLowerCase();
+  const lastName = employee.lastName.toLowerCase();
+
+  switch (pattern) {
+    case "firstname":
+      return `${firstName}@${domain}`;
+    case "firstname.lastname":
+      return `${firstName}.${lastName}@${domain}`;
+    case "firstnamelastname":
+      return `${firstName}${lastName}@${domain}`;
+    case "f.lastname":
+      return `${firstName[0]}.${lastName}@${domain}`;
+    case "flastname":
+      return `${firstName[0]}${lastName}@${domain}`;
+    default:
+      return `${firstName}.${lastName}@${domain}`; // fallback
+  }
+}
+
+// Modified batch processing function with pattern detection
+async function processBatchValidationWithPatterns(fileId, employees, domain) {
+  const job = fileJobs.get(fileId);
+  const results = [];
+  let detectedPattern = domainPatterns.get(domain); // Check if we already know the pattern
+
+  try {
+    log("info", "Starting batch processing with pattern detection", {
+      fileId,
+      totalEmployees: employees.length,
+      domain,
+      existingPattern: detectedPattern,
+    });
+
+    for (const employee of employees) {
+      try {
+        let email;
+        let valid = false;
+        let error = "";
+
+        if (detectedPattern) {
+          // Use detected pattern
+          email = generateEmailFromPattern(employee, domain, detectedPattern);
+
+          // Quick SMTP validation
+          const mxServers = await getMXServers(domain);
+          if (mxServers.length > 0) {
+            for (const mxServer of mxServers) {
+              try {
+                valid = await testSmtpConnection(mxServer, email);
+                if (valid) break;
+              } catch (err) {
+                error = err.message;
+              }
+            }
+          }
+        } else {
+          // Try different patterns until we find one that works
+          const patterns = [
+            "firstname",
+            "firstname.lastname",
+            "firstnamelastname",
+            "f.lastname",
+            "flastname",
+          ];
+          const mxServers = await getMXServers(domain);
+
+          if (mxServers.length === 0) {
+            error = "No MX records found";
+          } else {
+            for (const pattern of patterns) {
+              const testEmail = generateEmailFromPattern(
+                employee,
+                domain,
+                pattern
+              );
+
+              for (const mxServer of mxServers) {
+                try {
+                  const testResult = await testSmtpConnection(
+                    mxServer,
+                    testEmail
+                  );
+                  if (testResult) {
+                    // Found the pattern!
+                    detectedPattern = pattern;
+                    domainPatterns.set(domain, pattern);
+                    email = testEmail;
+                    valid = true;
+
+                    log("info", "Email pattern detected", {
+                      domain,
+                      pattern,
+                      testEmail,
+                      employee: employee.name,
+                    });
+
+                    break;
+                  }
+                } catch (err) {
+                  error = err.message;
+                }
+              }
+
+              if (valid) break; // Found working pattern, stop testing
+            }
+          }
+        }
+
+        // Update job progress
+        job.processedEmails++;
+        if (valid) {
+          job.validEmails++;
+        } else {
+          job.invalidEmails++;
+        }
+
+        results.push({
+          name: employee.name,
+          firstName: employee.firstName,
+          lastName: employee.lastName,
+          position: employee.position,
+          email: email || "not_found",
+          status: valid ? "valid" : "invalid",
+          error: valid ? "" : error,
+          domain,
+          pattern: detectedPattern || "unknown",
+          processed_at: new Date().toISOString(),
+        });
+      } catch (err) {
+        job.processedEmails++;
+        job.invalidEmails++;
+        results.push({
+          name: employee.name,
+          firstName: employee.firstName,
+          lastName: employee.lastName,
+          position: employee.position,
+          email: "error",
+          status: "invalid",
+          error: err.message,
+          domain,
+          pattern: "unknown",
+          processed_at: new Date().toISOString(),
+        });
+      }
+    }
+
+    // Save results to CSV
+    const resultPath = path.join(RESULTS_DIR, `${fileId}_results.csv`);
+    const csvData = Papa.unparse(results, {
+      header: true,
+      columns: [
+        "name",
+        "firstName",
+        "lastName",
+        "position",
+        "email",
+        "status",
+        "error",
+        "domain",
+        "pattern",
+        "processed_at",
+      ],
+    });
+
+    await fs.writeFile(resultPath, csvData);
+
+    // Update job status
+    job.status = "complete";
+    job.completedAt = new Date().toISOString();
+
+    log("info", "Batch processing completed with pattern", {
+      fileId,
+      totalEmployees: employees.length,
+      validEmails: job.validEmails,
+      invalidEmails: job.invalidEmails,
+      detectedPattern,
+      domain,
+    });
+  } catch (error) {
+    job.status = "error";
+    job.error = error.message;
+    job.completedAt = new Date().toISOString();
+
+    log("error", "Batch processing failed", {
+      fileId,
+      error: error.message,
+    });
+  }
 }
