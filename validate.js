@@ -575,7 +575,6 @@ async function testSmtpConnection(mxServer, targetEmail) {
           `EHLO ${domain}\r\n`,
           `MAIL FROM:<${sender}>\r\n`,
           `RCPT TO:<${targetEmail}>\r\n`,
-          `VRFY ${targetEmail.split("@")[0]}\r\n`, // ADD: Verify user exists
           `QUIT\r\n`,
         ];
 
@@ -607,7 +606,8 @@ async function testSmtpConnection(mxServer, targetEmail) {
                 line.includes("undeliverable") ||
                 line.includes("does not exist") ||
                 line.includes("invalid recipient") ||
-                line.includes("user unknown")
+                line.includes("user unknown") ||
+                line.includes("mailbox unavailable")
               ) {
                 success = false;
               } else {
@@ -615,14 +615,8 @@ async function testSmtpConnection(mxServer, targetEmail) {
               }
             } else if (code === 550 || code === 551 || code === 553) {
               success = false;
-            }
-            sendNext();
-          } else if (step === 3) {
-            // VRFY command
-            if (code === 250) {
-              success = true; // User verified
-            } else if (code === 550 || code === 551 || code === 252) {
-              success = false; // User doesn't exist or verification disabled
+            } else {
+              success = code >= 200 && code < 300;
             }
             sendNext();
           } else if (code >= 200 && code < 300) {
