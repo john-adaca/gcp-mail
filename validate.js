@@ -575,6 +575,7 @@ async function testSmtpConnection(mxServer, targetEmail) {
           `EHLO ${domain}\r\n`,
           `MAIL FROM:<${sender}>\r\n`,
           `RCPT TO:<${targetEmail}>\r\n`,
+          `VRFY ${targetEmail.split("@")[0]}\r\n`, // ADD: Verify user exists
           `QUIT\r\n`,
         ];
 
@@ -599,7 +600,30 @@ async function testSmtpConnection(mxServer, targetEmail) {
           if (step === -1 && code === 220) {
             sendNext();
           } else if (step === 2) {
-            success = code === 250 || code === 251;
+            // Enhanced RCPT TO response analysis
+            if (code === 250 || code === 251) {
+              // Check for specific rejection patterns even with 250 response
+              if (
+                line.includes("undeliverable") ||
+                line.includes("does not exist") ||
+                line.includes("invalid recipient") ||
+                line.includes("user unknown")
+              ) {
+                success = false;
+              } else {
+                success = true;
+              }
+            } else if (code === 550 || code === 551 || code === 553) {
+              success = false;
+            }
+            sendNext();
+          } else if (step === 3) {
+            // VRFY command
+            if (code === 250) {
+              success = true; // User verified
+            } else if (code === 550 || code === 551 || code === 252) {
+              success = false; // User doesn't exist or verification disabled
+            }
             sendNext();
           } else if (code >= 200 && code < 300) {
             sendNext();
@@ -681,7 +705,6 @@ async function testSmtpConnection(mxServer, targetEmail) {
 
   return false;
 }
-
 export async function testNetworkConnectivity(req, res) {
   const testResults = {
     timestamp: new Date().toISOString(),
