@@ -20,12 +20,73 @@ const SMTP_TIMEOUT = 30000;
 const UPLOAD_DIR = "./uploads";
 const RESULTS_DIR = "./results";
 
+// Global pattern storage for domains
+const domainPatterns = new Map();
+
 // Ensure directories exist
 await fs.mkdir(UPLOAD_DIR, { recursive: true });
 await fs.mkdir(RESULTS_DIR, { recursive: true });
 
 // In-memory store for file processing status
 const fileJobs = new Map();
+
+// Helper functions for pattern detection
+function detectPatternFromEmail(email, firstName, lastName) {
+  const [localPart] = email.split("@");
+  const first = firstName.toLowerCase();
+  const last = lastName.toLowerCase();
+
+  if (localPart === first) return "firstname";
+  if (localPart === `${first}.${last}`) return "firstname.lastname";
+  if (localPart === `${first}${last}`) return "firstnamelastname";
+  if (localPart === `${first[0]}.${last}`) return "f.lastname";
+  if (localPart === `${first[0]}${last}`) return "flastname";
+
+  return null;
+}
+
+function generateEmailFromPattern(firstName, lastName, domain, pattern) {
+  const first = firstName.toLowerCase();
+  const last = lastName.toLowerCase();
+
+  switch (pattern) {
+    case "firstname":
+      return `${first}@${domain}`;
+    case "firstname.lastname":
+      return `${first}.${last}@${domain}`;
+    case "firstnamelastname":
+      return `${first}${last}@${domain}`;
+    case "f.lastname":
+      return `${first[0]}.${last}@${domain}`;
+    case "flastname":
+      return `${first[0]}${last}@${domain}`;
+    default:
+      return `${first}.${last}@${domain}`;
+  }
+}
+
+function inferPatternFromEmail(email) {
+  const [localPart] = email.split("@");
+
+  // Simple pattern detection based on email format
+  if (localPart.includes(".") && localPart.split(".").length === 2) {
+    return "firstname.lastname";
+  } else if (localPart.length <= 10 && /^[a-z]+$/.test(localPart)) {
+    return "firstname";
+  } else if (localPart.length > 10 && !localPart.includes(".")) {
+    return "firstnamelastname";
+  } else if (localPart.includes(".") && localPart.split(".")[0].length === 1) {
+    return "f.lastname";
+  } else if (
+    localPart.length <= 8 &&
+    localPart[1] &&
+    /^[a-z][a-z]+$/.test(localPart)
+  ) {
+    return "flastname";
+  }
+
+  return "unknown";
+}
 
 export async function validateEmail(req, res) {
   res.set("Access-Control-Allow-Origin", "*");
@@ -97,6 +158,16 @@ export async function validateEmail(req, res) {
             mxServer,
             validationResult: true,
           });
+
+          // Store pattern when email validates successfully
+          const pattern = inferPatternFromEmail(email);
+          domainPatterns.set(domain, pattern);
+          log("info", "Pattern stored from successful validation", {
+            domain,
+            email,
+            pattern,
+          });
+
           break;
         }
       } catch (error) {
@@ -114,6 +185,7 @@ export async function validateEmail(req, res) {
       email,
       domain,
       mxServers,
+      pattern: domainPatterns.get(domain) || "unknown",
       error: result ? null : lastError || "No SMTP servers responded",
     };
 
@@ -136,8 +208,6 @@ export async function validateEmail(req, res) {
   }
 }
 
-// NEW: Upload CSV file for batch validation
-// Update your existing validateBatch function
 export async function validateBatch(req, res) {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -166,9 +236,10 @@ export async function validateBatch(req, res) {
         fileId,
         totalEmployees: employees.length,
         domain,
+        existingPattern: domainPatterns.get(domain),
       });
     } else {
-      // CSV upload mode (existing functionality)
+      // CSV upload mode
       const file = req.file || req.body.file;
       const emailColumn = req.body.email_address_column || "1";
       const hasHeader = req.body.has_header_row === "true";
@@ -203,6 +274,29 @@ export async function validateBatch(req, res) {
         removeDuplicates
       );
 
+      // Try to detect domain patterns from the email list
+      const domainPatternMap = new Map();
+
+      for (const email of emails) {
+        const emailDomain = email.split("@")[1];
+
+        if (!domainPatternMap.has(emailDomain)) {
+          const pattern = inferPatternFromEmail(email);
+          domainPatternMap.set(emailDomain, pattern);
+        }
+      }
+
+      // Store detected patterns globally if not already stored
+      domainPatternMap.forEach((pattern, emailDomain) => {
+        if (!domainPatterns.has(emailDomain)) {
+          domainPatterns.set(emailDomain, pattern);
+          log("info", "Domain pattern inferred from CSV", {
+            domain: emailDomain,
+            pattern,
+          });
+        }
+      });
+
       log("info", "CSV upload mode", {
         fileId,
         totalEmails: emails.length,
@@ -230,7 +324,7 @@ export async function validateBatch(req, res) {
     if (isEmployeeValidation) {
       processBatchValidationWithPatterns(fileId, employees, domain);
     } else {
-      processBatchValidation(fileId, emails); // Your existing function
+      processBatchValidation(fileId, emails);
     }
 
     res.json({
@@ -249,7 +343,6 @@ export async function validateBatch(req, res) {
   }
 }
 
-// NEW: Check file processing status
 export async function fileStatus(req, res) {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -314,7 +407,6 @@ export async function fileStatus(req, res) {
   }
 }
 
-// NEW: Download processed results
 export async function downloadFile(req, res) {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -364,7 +456,6 @@ export async function downloadFile(req, res) {
 
     log("info", "File download requested", { fileId });
 
-    // Set headers for CSV download
     res.set("Content-Type", "text/csv");
     res.set(
       "Content-Disposition",
@@ -399,18 +490,15 @@ async function extractEmailsFromCSV(
         try {
           let data = results.data;
 
-          // Remove header if specified
           if (hasHeader && data.length > 0) {
             data = data.slice(1);
           }
 
-          // Extract emails from specified column (1-indexed)
           const columnIndex = parseInt(emailColumn) - 1;
           let emails = data
             .map((row) => row[columnIndex])
             .filter((email) => email && email.includes("@"));
 
-          // Remove duplicates if specified
           if (removeDuplicates) {
             emails = [...new Set(emails.map((email) => email.toLowerCase()))];
           }
@@ -427,7 +515,7 @@ async function extractEmailsFromCSV(
   });
 }
 
-// Background processing function
+// Background processing function for CSV emails
 async function processBatchValidation(fileId, emails) {
   const job = fileJobs.get(fileId);
   const maxConcurrent = 3;
@@ -456,14 +544,27 @@ async function processBatchValidation(fileId, emails) {
               for (const mxServer of mxServers) {
                 try {
                   valid = await testSmtpConnection(mxServer, email);
-                  if (valid) break;
+                  if (valid) {
+                    // Store pattern when email validates successfully
+                    const pattern = inferPatternFromEmail(email);
+                    domainPatterns.set(domain, pattern);
+                    log(
+                      "info",
+                      "Pattern confirmed from successful validation",
+                      {
+                        domain,
+                        email,
+                        pattern,
+                      }
+                    );
+                    break;
+                  }
                 } catch (err) {
                   error = err.message;
                 }
               }
             }
 
-            // Update job progress
             job.processedEmails++;
             if (valid) {
               job.validEmails++;
@@ -476,6 +577,7 @@ async function processBatchValidation(fileId, emails) {
               status: valid ? "valid" : "invalid",
               error: valid ? "" : error,
               domain,
+              pattern: domainPatterns.get(domain) || "unknown",
               mxServers: mxServers.join(", "),
               processed_at: new Date().toISOString(),
             };
@@ -487,6 +589,7 @@ async function processBatchValidation(fileId, emails) {
               status: "invalid",
               error: err.message,
               domain: "",
+              pattern: "unknown",
               mxServers: "",
               processed_at: new Date().toISOString(),
             };
@@ -496,13 +599,11 @@ async function processBatchValidation(fileId, emails) {
 
       results.push(...batchResults);
 
-      // Small delay between batches
       if (i + maxConcurrent < emails.length) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
     }
 
-    // Save results to CSV
     const resultPath = path.join(RESULTS_DIR, `${fileId}_results.csv`);
     const csvData = Papa.unparse(results, {
       header: true,
@@ -511,6 +612,7 @@ async function processBatchValidation(fileId, emails) {
         "status",
         "error",
         "domain",
+        "pattern",
         "mxServers",
         "processed_at",
       ],
@@ -518,7 +620,6 @@ async function processBatchValidation(fileId, emails) {
 
     await fs.writeFile(resultPath, csvData);
 
-    // Update job status
     job.status = "complete";
     job.completedAt = new Date().toISOString();
 
@@ -541,7 +642,195 @@ async function processBatchValidation(fileId, emails) {
   }
 }
 
-// Existing helper functions remain the same...
+// Background processing function for employee validation with patterns
+async function processBatchValidationWithPatterns(fileId, employees, domain) {
+  const job = fileJobs.get(fileId);
+  const maxConcurrent = 3;
+  const results = [];
+  let detectedPattern = domainPatterns.get(domain);
+
+  try {
+    log("info", "Starting employee batch processing with patterns", {
+      fileId,
+      totalEmployees: employees.length,
+      domain,
+      existingPattern: detectedPattern,
+    });
+
+    for (let i = 0; i < employees.length; i += maxConcurrent) {
+      const batch = employees.slice(i, i + maxConcurrent);
+
+      const batchResults = await Promise.all(
+        batch.map(async (employee) => {
+          try {
+            let email;
+            let valid = false;
+            let error = "";
+
+            if (detectedPattern) {
+              // Use detected pattern
+              email = generateEmailFromPattern(
+                employee.firstName,
+                employee.lastName,
+                domain,
+                detectedPattern
+              );
+
+              const mxServers = await getMXServers(domain);
+              if (mxServers.length === 0) {
+                error = "No MX records found";
+              } else {
+                for (const mxServer of mxServers) {
+                  try {
+                    valid = await testSmtpConnection(mxServer, email);
+                    if (valid) break;
+                  } catch (err) {
+                    error = err.message;
+                  }
+                }
+              }
+            } else {
+              // Try different patterns until we find one that works
+              const patterns = [
+                "firstname",
+                "firstname.lastname",
+                "firstnamelastname",
+                "f.lastname",
+                "flastname",
+              ];
+              const mxServers = await getMXServers(domain);
+
+              if (mxServers.length === 0) {
+                error = "No MX records found";
+              } else {
+                for (const pattern of patterns) {
+                  const testEmail = generateEmailFromPattern(
+                    employee.firstName,
+                    employee.lastName,
+                    domain,
+                    pattern
+                  );
+
+                  for (const mxServer of mxServers) {
+                    try {
+                      const testResult = await testSmtpConnection(
+                        mxServer,
+                        testEmail
+                      );
+                      if (testResult) {
+                        // Found the pattern!
+                        detectedPattern = pattern;
+                        domainPatterns.set(domain, pattern);
+                        email = testEmail;
+                        valid = true;
+
+                        log("info", "Email pattern detected", {
+                          domain,
+                          pattern,
+                          testEmail,
+                          employee: employee.name,
+                        });
+
+                        break;
+                      }
+                    } catch (err) {
+                      error = err.message;
+                    }
+                  }
+
+                  if (valid) break;
+                }
+              }
+            }
+
+            job.processedEmails++;
+            if (valid) {
+              job.validEmails++;
+            } else {
+              job.invalidEmails++;
+            }
+
+            return {
+              name: employee.name,
+              firstName: employee.firstName,
+              lastName: employee.lastName,
+              position: employee.position,
+              email: email || "not_found",
+              status: valid ? "valid" : "invalid",
+              error: valid ? "" : error,
+              domain: domain,
+              pattern: detectedPattern || "unknown",
+              processed_at: new Date().toISOString(),
+            };
+          } catch (err) {
+            job.processedEmails++;
+            job.invalidEmails++;
+            return {
+              name: employee.name,
+              firstName: employee.firstName,
+              lastName: employee.lastName,
+              position: employee.position,
+              email: "error",
+              status: "invalid",
+              error: err.message,
+              domain: domain,
+              pattern: "unknown",
+              processed_at: new Date().toISOString(),
+            };
+          }
+        })
+      );
+
+      results.push(...batchResults);
+
+      if (i + maxConcurrent < employees.length) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
+
+    const resultPath = path.join(RESULTS_DIR, `${fileId}_results.csv`);
+    const csvData = Papa.unparse(results, {
+      header: true,
+      columns: [
+        "name",
+        "firstName",
+        "lastName",
+        "position",
+        "email",
+        "status",
+        "error",
+        "domain",
+        "pattern",
+        "processed_at",
+      ],
+    });
+
+    await fs.writeFile(resultPath, csvData);
+
+    job.status = "complete";
+    job.completedAt = new Date().toISOString();
+
+    log("info", "Employee batch processing completed", {
+      fileId,
+      totalEmployees: employees.length,
+      validEmails: job.validEmails,
+      invalidEmails: job.invalidEmails,
+      detectedPattern,
+      domain,
+      processingTime: new Date() - new Date(job.startedAt),
+    });
+  } catch (error) {
+    job.status = "error";
+    job.error = error.message;
+    job.completedAt = new Date().toISOString();
+
+    log("error", "Employee batch processing failed", {
+      fileId,
+      error: error.message,
+    });
+  }
+}
+
 async function getMXServers(domain) {
   try {
     log("debug", "Looking up MX records", { domain });
@@ -627,7 +916,6 @@ async function testSmtpConnection(mxServer, targetEmail) {
           } else if (step === 2) {
             // Enhanced RCPT TO response analysis
             if (code === 250 || code === 251) {
-              // Check for specific rejection patterns even with 250 response
               if (
                 line.includes("undeliverable") ||
                 line.includes("does not exist") ||
@@ -725,6 +1013,7 @@ async function testSmtpConnection(mxServer, targetEmail) {
 
   return false;
 }
+
 export async function testNetworkConnectivity(req, res) {
   const testResults = {
     timestamp: new Date().toISOString(),
@@ -813,219 +1102,4 @@ async function testPortConnectivity(host, port, timeout = 5000) {
       resolve(false);
     });
   });
-}
-const domainPatterns = new Map(); // Store detected patterns per domain
-
-// Add this function to detect pattern from a successful email
-function detectPatternFromEmail(email, employee) {
-  const [localPart, domain] = email.split("@");
-  const firstName = employee.firstName.toLowerCase();
-  const lastName = employee.lastName.toLowerCase();
-
-  // Determine which pattern this email follows
-  if (localPart === firstName) {
-    return "firstname";
-  } else if (localPart === `${firstName}.${lastName}`) {
-    return "firstname.lastname";
-  } else if (localPart === `${firstName}${lastName}`) {
-    return "firstnamelastname";
-  } else if (localPart === `${firstName[0]}.${lastName}`) {
-    return "f.lastname";
-  } else if (localPart === `${firstName[0]}${lastName}`) {
-    return "flastname";
-  }
-
-  return "unknown";
-}
-
-// Add this function to generate email based on detected pattern
-function generateEmailFromPattern(employee, domain, pattern) {
-  const firstName = employee.firstName.toLowerCase();
-  const lastName = employee.lastName.toLowerCase();
-
-  switch (pattern) {
-    case "firstname":
-      return `${firstName}@${domain}`;
-    case "firstname.lastname":
-      return `${firstName}.${lastName}@${domain}`;
-    case "firstnamelastname":
-      return `${firstName}${lastName}@${domain}`;
-    case "f.lastname":
-      return `${firstName[0]}.${lastName}@${domain}`;
-    case "flastname":
-      return `${firstName[0]}${lastName}@${domain}`;
-    default:
-      return `${firstName}.${lastName}@${domain}`; // fallback
-  }
-}
-
-// Modified batch processing function with pattern detection
-async function processBatchValidationWithPatterns(fileId, employees, domain) {
-  const job = fileJobs.get(fileId);
-  const results = [];
-  let detectedPattern = domainPatterns.get(domain); // Check if we already know the pattern
-
-  try {
-    log("info", "Starting batch processing with pattern detection", {
-      fileId,
-      totalEmployees: employees.length,
-      domain,
-      existingPattern: detectedPattern,
-    });
-
-    for (const employee of employees) {
-      try {
-        let email;
-        let valid = false;
-        let error = "";
-
-        if (detectedPattern) {
-          // Use detected pattern
-          email = generateEmailFromPattern(employee, domain, detectedPattern);
-
-          // Quick SMTP validation
-          const mxServers = await getMXServers(domain);
-          if (mxServers.length > 0) {
-            for (const mxServer of mxServers) {
-              try {
-                valid = await testSmtpConnection(mxServer, email);
-                if (valid) break;
-              } catch (err) {
-                error = err.message;
-              }
-            }
-          }
-        } else {
-          // Try different patterns until we find one that works
-          const patterns = [
-            "firstname",
-            "firstname.lastname",
-            "firstnamelastname",
-            "f.lastname",
-            "flastname",
-          ];
-          const mxServers = await getMXServers(domain);
-
-          if (mxServers.length === 0) {
-            error = "No MX records found";
-          } else {
-            for (const pattern of patterns) {
-              const testEmail = generateEmailFromPattern(
-                employee,
-                domain,
-                pattern
-              );
-
-              for (const mxServer of mxServers) {
-                try {
-                  const testResult = await testSmtpConnection(
-                    mxServer,
-                    testEmail
-                  );
-                  if (testResult) {
-                    // Found the pattern!
-                    detectedPattern = pattern;
-                    domainPatterns.set(domain, pattern);
-                    email = testEmail;
-                    valid = true;
-
-                    log("info", "Email pattern detected", {
-                      domain,
-                      pattern,
-                      testEmail,
-                      employee: employee.name,
-                    });
-
-                    break;
-                  }
-                } catch (err) {
-                  error = err.message;
-                }
-              }
-
-              if (valid) break; // Found working pattern, stop testing
-            }
-          }
-        }
-
-        // Update job progress
-        job.processedEmails++;
-        if (valid) {
-          job.validEmails++;
-        } else {
-          job.invalidEmails++;
-        }
-
-        results.push({
-          name: employee.name,
-          firstName: employee.firstName,
-          lastName: employee.lastName,
-          position: employee.position,
-          email: email || "not_found",
-          status: valid ? "valid" : "invalid",
-          error: valid ? "" : error,
-          domain,
-          pattern: detectedPattern || "unknown",
-          processed_at: new Date().toISOString(),
-        });
-      } catch (err) {
-        job.processedEmails++;
-        job.invalidEmails++;
-        results.push({
-          name: employee.name,
-          firstName: employee.firstName,
-          lastName: employee.lastName,
-          position: employee.position,
-          email: "error",
-          status: "invalid",
-          error: err.message,
-          domain,
-          pattern: "unknown",
-          processed_at: new Date().toISOString(),
-        });
-      }
-    }
-
-    // Save results to CSV
-    const resultPath = path.join(RESULTS_DIR, `${fileId}_results.csv`);
-    const csvData = Papa.unparse(results, {
-      header: true,
-      columns: [
-        "name",
-        "firstName",
-        "lastName",
-        "position",
-        "email",
-        "status",
-        "error",
-        "domain",
-        "pattern",
-        "processed_at",
-      ],
-    });
-
-    await fs.writeFile(resultPath, csvData);
-
-    // Update job status
-    job.status = "complete";
-    job.completedAt = new Date().toISOString();
-
-    log("info", "Batch processing completed with pattern", {
-      fileId,
-      totalEmployees: employees.length,
-      validEmails: job.validEmails,
-      invalidEmails: job.invalidEmails,
-      detectedPattern,
-      domain,
-    });
-  } catch (error) {
-    job.status = "error";
-    job.error = error.message;
-    job.completedAt = new Date().toISOString();
-
-    log("error", "Batch processing failed", {
-      fileId,
-      error: error.message,
-    });
-  }
 }
